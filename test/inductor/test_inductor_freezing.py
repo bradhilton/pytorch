@@ -261,12 +261,8 @@ class OptimizeForInferenceTemplate(TestCase):
                 FileCheck().check_not("@triton.jit").run(code[0])
                 self.assertEqual(out_eager, out_compiled)
 
+    @torch._inductor.config.patch("cpp.enable_concat_linear", True)
     def test_mm_concat(self):
-        # CPU path will replace mm with mkl._linear,
-        # skip this case for now.
-        if self.device == "cpu":
-            raise unittest.SkipTest("NYI CPU")
-
         class MM(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
@@ -319,12 +315,32 @@ class OptimizeForInferenceTemplate(TestCase):
                 return mod(inp)
 
             kernel_invoke = "kernel_cpp_0" if self.device == "cpu" else "triton.jit"
+            mm_invoke = "mm("
+            # https://github.com/pytorch/pytorch/blob/e754611d190b323e53c5d17db0dc39a96687513c/torch/_inductor/fx_passes/mkldnn_fusion.py#L1263
+            mkldnn_weight_pack_init = (
+                torch.backends.mkldnn.enabled and torch.backends.mkldnn.is_available()
+            )
+            if self.device == "cpu" and mkldnn_weight_pack_init:
+                if torch.ops.mkldnn._is_mkldnn_acl_supported():
+                    # for aarch64 with acl supported, use mkldnn weight prepack
+                    # https://github.com/pytorch/pytorch/blob/e754611d190b323e53c5d17db0dc39a96687513c/torch/_inductor/fx_passes/mkldnn_fusion.py#L1176-L1184
+                    mm_invoke = "mkldnn._linear_pointwise.default("
+                elif torch._C.has_mkl:
+                    mm_invoke = "mkl_linear.default("
+            mkl_packable = (
+                torch.ops.mkldnn._is_mkldnn_acl_supported() or torch._C.has_mkl
+            )
+            mm_invoke = (
+                "mkl_linear.default("
+                if self.device == "cpu" and mkldnn_weight_pack_init and mkl_packable
+                else "mm("
+            )
 
             with torch.no_grad():
                 out_eager = mod(inp)
                 out, code = run_and_get_code(foo, mod, inp)
                 FileCheck().check_not(kernel_invoke).check_count(
-                    "mm(", count=1, exactly=True
+                    mm_invoke, count=1, exactly=True
                 ).run(code[0])
                 self.assertEqual(out_eager, out)
 
@@ -343,7 +359,7 @@ class OptimizeForInferenceTemplate(TestCase):
                 out_eager = mod2(inp)
                 out, code = run_and_get_code(foo, mod2, inp)
                 FileCheck().check_not(kernel_invoke).check_count(
-                    "mm(", count=count, exactly=True
+                    mm_invoke, count=count, exactly=True
                 ).run(code[0])
                 self.assertEqual(out_eager, out)
 
